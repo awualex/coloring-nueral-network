@@ -38,7 +38,7 @@ import tensorflow as tf
 
 
 class CCGAN():
-    def __init__(self, batchsize = 4):
+    def __init__(self, batch_size = 4):
         # input image being 256 * 256 * 3&1
         self.img_rows = 256
         self.img_cols = 256
@@ -89,12 +89,13 @@ class CCGAN():
         #self.discriminator.trainable = False
 
         # The valid takes generated images as input and determines validity - the chance of it being true images that discriminator thinks
-        valid = self.discriminator(gen_img)
+        validity = self.discriminator(gen_img)
 
         # The combined model  (stacked generator and discriminator)
         # Trains the generator to fool the discriminator
 
-        self.combined = Model(inputs=[Color_hint, Line_image], valid)
+        self.combined = Model( inputs= [Color_hint, Line_image], validity)
+
         self.combined.compile(loss=['mse'],
             optimizer=optimizer)
         
@@ -185,7 +186,7 @@ class CCGAN():
         model.add(InstanceNormalization())
         # here output is (16 * 16 * self.df * 8)
         model.add(Flatten())
-        model.add(Dense(1, activation="sigmoid"))
+        model.add(Dense(1))
 
         model.summary()
 
@@ -194,63 +195,107 @@ class CCGAN():
         return Model(img, validity)
 
     #just ignore this one; still working on it
-    def train(self, epochs, batch_size=4, sample_interval=50):
+    def train(self, epochs = 20000, batch_size=4, sample_interval = 100):
+        
+        #load the weights to model
+        self.loadmodel()
 
         # Load the dataset
-        (X_train, y_train), (_, _) = mnist.load_data()
+        data = glob(os.path.join('imgs', '*.jpg'))
+        print(data[0])
 
-        # Rescale MNIST to 32x32
-        X_train = np.array([scipy.misc.imresize(x, [self.img_rows, self.img_cols]) for x in X_train])
+        #base image to show
+        base = np.array([get_image(sample_file) for sample_file in data[0:self.batch_size]])
+        base_noramlized = base/255.0
 
-        # Rescale -1 to 1
-        X_train = (X_train.astype(np.float32) - 127.5) / 127.5
-        X_train = np.expand_dims(X_train, axis=3)
-        y_train = y_train.reshape(-1, 1)
+        #line image to show
+        base_edge = np.array([cv2.adaptiveThreshold(cv2.cvtColor(ba, cv2.COLOR_BGR2GRAY), 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, blockSize=9, C=2) for ba in base]) / 255.0
+        base_edge = np.expand_dims(base_edge, 3)
+
+        #colorhint
+        base_colors = np.array([self.imageblur(ba) for ba in base]) / 255.0
+
+        ims("results/base.png",merge_color(base_normalized, [self.batch_size_sqrt, self.batch_size_sqrt]))
+        ims("results/base_line.jpg",merge(base_edge, [self.batch_size_sqrt, self.batch_size_sqrt]))
+        ims("results/base_colors.jpg",merge_color(base_colors, [self.batch_size_sqrt, self.batch_size_sqrt]))        
 
         # Adversarial ground truths
-        valid = np.ones((batch_size, 4, 4, 1))
-        fake = np.zeros((batch_size, 4, 4, 1))
+        valid = np.ones((batch_size, 1))
+        fake = np.zeros((batch_size, 1))
+
+        datalen = len(data)
 
         for epoch in range(epochs):
+            for i in range(datalen/batch_size):
 
-            # ---------------------
-            #  Train Discriminator
-            # ---------------------
+                #get one batch of data
+                batch_files = data[i*self.batch_size:(i+1)*self.batch_size]
+                batch = np.array([get_image(batch_file) for batch_file in batch_files])
+                batch_normalized = batch/255.0
 
-            # Sample half batch of images
-            idx = np.random.randint(0, X_train.shape[0], batch_size)
-            imgs = X_train[idx]
-            labels = y_train[idx]
+                batch_edge = np.array([cv2.adaptiveThreshold(cv2.cvtColor(ba, cv2.COLOR_BGR2GRAY), 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, blockSize=9, C=2) for ba in batch]) / 255.0
+                batch_edge = np.expand_dims(batch_edge, 3)
 
-            masked_imgs = self.mask_randomly(imgs)
+                batch_colors = np.array([self.imageblur(ba) for ba in batch]) / 255.0
+                # ---------------------
+                #  Train Discriminator
+                # ---------------------
 
-            # Generate a half batch of new images
-            gen_imgs = self.generator.predict(masked_imgs)
+                # Generate a batch of new images
+                gen_imgs = self.generator.predict([batch_colors, batch_edge])
 
-            # One-hot encoding of labels
-            labels = to_categorical(labels, num_classes=self.num_classes+1)
-            fake_labels = to_categorical(np.full((batch_size, 1), self.num_classes), num_classes=self.num_classes+1)
+                # Train the discriminator
+                d_loss_real = self.discriminator.train_on_batch(batch_normalized, valid)
+                d_loss_fake = self.discriminator.train_on_batch(gen_imgs, fake)
+                d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
 
-            # Train the discriminator
-            d_loss_real = self.discriminator.train_on_batch(imgs, [valid, labels])
-            d_loss_fake = self.discriminator.train_on_batch(gen_imgs, [fake, fake_labels])
-            d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+                # ---------------------
+                #  Train Generator
+                # ---------------------
 
-            # ---------------------
-            #  Train Generator
-            # ---------------------
+                # Train the generator
+                g_loss = self.combined.train_on_batch([batch_colors, batch_edge], valid)
 
-            # Train the generator
-            g_loss = self.combined.train_on_batch(masked_imgs, valid)
+                # Plot the progress
+                print ("%d [D loss: %f, op_acc: %.2f%%] [G loss: %f]" % (epoch, d_loss[0], 100*d_loss[4], g_loss))
 
-            # Plot the progress
-            print ("%d [D loss: %f, op_acc: %.2f%%] [G loss: %f]" % (epoch, d_loss[0], 100*d_loss[4], g_loss))
+                # If at save interval => save generated image samples
+                if epoch % sample_interval == 0:
+                    # Select a random half batch of 
+                    
+                    self.sample_images(epoch, imgs)
+                    self.save_model()
 
-            # If at save interval => save generated image samples
-            if epoch % sample_interval == 0:
-                # Select a random half batch of images
-                idx = np.random.randint(0, X_train.shape[0], 6)
-                imgs = X_train[idx]
-                self.sample_images(epoch, imgs)
-                self.save_model()
+    def save_model(self):
+
+        self.generator.save('ccgan_generator.h5')
+        self.discriminator.save('ccgan_generator.h5')
+        self.combined.save('ccgan.h5')
+    
+    def load_model(self, load_disc = True):
+
+        self.generator.loadO('ccgan_generator.h5') 
+        self.generator.summary()
+
+        if load_disc:
+            self.discriminator.load('ccgan_generator.h5')
+            self.combined.load('ccgan.h5') 
+            self.discriminator.summary()
+            self.combined.summary()
+
+
+
+        '''
+        def save(model, model_name):
+            model_path = "saved_model/%s.json" % model_name
+            weights_path = "saved_model/%s_weights.hdf5" % model_name
+            options = {"file_arch": model_path,
+                        "file_weight": weights_path}
+            json_string = model.to_json()
+            open(options['file_arch'], 'w').write(json_string)
+            model.save_weights(options['file_weight'])
+
+        save(self.generator, "ccgan_generator")
+        save(self.discriminator, "ccgan_discriminator")
+        '''
 
